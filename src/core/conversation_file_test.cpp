@@ -360,6 +360,142 @@ int main() {
               "image K/V plus sources refused");
     }
 
+    // --conversation-cache-disk-delta: a base file plus appended records that carry only the K/V from an offset on.
+    // A restore walks the base then every record in order and writes each block at its recorded offset, so a grown
+    // conversation is rebuilt exactly; a same-size edit inside a record is refused by its payload hash.
+    {
+        const fs::path base = dir / "delta-base.bin";
+        const fs::path log = dir / "delta.dlog";
+        check(session_file_write(base.string(), original, id, written, error), "delta: base write");
+        // the grown state: the base's K/V with every part's tail from byte 1024 on rewritten (a page boundary), and
+        // two more tokens so it is a longer conversation
+        SavedConversation grown = original;
+        grown.live.ids.push_back(9001);
+        grown.live.ids.push_back(9002);
+        grown.checkpoints.back() = checkpoint(1002, 7);
+        for (size_t i = 0; i < grown.kv.size(); ++i) {
+            const std::array<ConversationBuffer*, 5> parts = {&grown.kv[i].k, &grown.kv[i].v, &grown.kv[i].k_scale,
+                                                              &grown.kv[i].v_scale, &grown.kv[i].pooled};
+            for (size_t part = 0; part < 5; ++part) {
+                if (parts[part]->size() <= 1024) continue;
+                ConversationBuffer& b = *parts[part];
+                b.visit(1024, b.size() - 1024, [&](uint8_t* p, size_t c, size_t at) {
+                    for (size_t j = 0; j < c; ++j) p[j] = uint8_t((at + j) * 37u + i + part);
+                    return true;
+                });
+            }
+        }
+        auto delta_sources = [&](const SavedConversation& want, bool first_half) {
+            std::vector<SessionKvSource> sources;
+            for (const auto& k : want.kv) {
+                SessionKvSource s;
+                s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+                s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+                for (size_t i = 0; i < 5; ++i) s.first_bytes[i] = first_half && parts[i]->size() > 1024 ? 1024 : 0;
+                s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+                    return parts[part]->read(dst, offset, n);
+                };
+                sources.push_back(std::move(s));
+            }
+            return sources;
+        };
+        SavedConversation meta = grown;
+        meta.kv.clear();
+        auto sources = delta_sources(grown, true);
+        bool overflow = false;
+        const uint64_t estimate = session_delta_record_bytes(meta, sources, &overflow);
+        check(!overflow && estimate > 0, "delta: the record's size is counted");
+        uint64_t wrote = 0;
+        SessionWriteOptions opt;
+        check(session_delta_write(log.string(), 0, meta, sources, (int64_t) grown.live.ids.size(), id, wrote, error, opt),
+              "delta: record write");
+        check(wrote == estimate, "delta: the estimate equals the write");
+        check((uint64_t) fs::file_size(log) == wrote, "delta: the log holds exactly the record");
+        // the read pass: record structure, offsets and sizes
+        SessionReadLimits lim;   // open limits
+        SessionDeltaRecord rec;
+        uint64_t next = 0;
+        check(session_delta_read(log.string(), 0, wrote, id, lim, rec, next, error), "delta: record read");
+        check(next == wrote && rec.meta.live.ids == grown.live.ids, "delta: the record reads back whole");
+        check(rec.kv_offset.size() == grown.kv.size() && rec.kv_offset[0][0] == 1024 && rec.kv_bytes[0][0] > 0,
+              "delta: the K/V offsets are recorded");
+        check(session_delta_read(log.string(), 0, wrote - 1, id, lim, rec, next, error) == false,
+              "delta: a record past the committed length is refused");
+        // the apply: base then record, into plain host buffers, equals the grown state byte for byte
+        SavedConversation base_meta;
+        std::vector<std::array<uint64_t, 5>> base_sizes;
+        size_t base_bytes = 0;
+        check(session_file_read_streamed(base.string(), id, base_meta, base_bytes, error, lim, &base_sizes),
+              "delta: the base reads streamed");
+        std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(grown.kv.size());
+        for (size_t l = 0; l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; part < 5; ++part) rebuilt[l][part].resize(parts[part]->size());
+        }
+        auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
+            if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                n > rebuilt[layer][part].size() - offset) return false;
+            std::memcpy(rebuilt[layer][part].data() + offset, data, n);
+            return true;
+        };
+        check(session_file_apply_streamed(base.string(), id, sink, base_sizes, error),
+              "delta: the base applies");
+        check(session_delta_apply(log.string(), 0, id, rec, sink, error), "delta: the record applies");
+        bool rebuilt_same = true;
+        for (size_t l = 0; rebuilt_same && l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; rebuilt_same && part < 5; ++part) {
+                std::vector<uint8_t> want(parts[part]->size());
+                if (!want.empty())
+                    parts[part]->visit(0, want.size(), [&](const uint8_t* p, size_t c, size_t at) {
+                        std::memcpy(want.data() + at, p, c);
+                        return true;
+                    });
+                rebuilt_same = rebuilt[l][part] == want;
+            }
+        }
+        check(rebuilt_same, "delta: base + record rebuild the grown K/V exactly");
+        // a second record appends after the first; the two reapply in order
+        uint64_t wrote2 = 0;
+        SavedConversation meta2 = grown;
+        meta2.kv.clear();
+        auto sources2 = delta_sources(original, true);   // the K/V prefix (the rewritten-with-wrong-tail check)
+        check(session_delta_write(log.string(), wrote, meta2, sources2, (int64_t) grown.live.ids.size(), id, wrote2,
+                                  error, opt), "delta: append the second record");
+        SessionDeltaRecord rec2;
+        check(session_delta_read(log.string(), wrote, wrote + wrote2, id, lim, rec2, next, error) && next == wrote + wrote2,
+              "delta: the second record reads at its offset");
+        // a same-size edit inside the first record is refused by the hash
+        const std::vector<char> pristine = slurp(log);
+        {
+            std::vector<char> edited = pristine;
+            edited[64] = char(edited[64] ^ 0x40);
+            spit(log, edited);
+            SessionDeltaRecord bad;
+            uint64_t at = 0;
+            check(!session_delta_read(log.string(), 0, wrote + wrote2, id, lim, bad, at, error) &&
+                  error.find("checksum") != std::string::npos, "delta: an edited record is refused");
+            spit(log, pristine);   // put the record back for the checks below
+        }
+        // a wrong identity is refused
+        check(!session_delta_read(log.string(), 0, wrote + wrote2, {id.model ^ 1, id.config}, lim, rec, next, error),
+              "delta: a foreign identity is refused");
+        // the apply pass refuses a record whose recorded part sizes differ from the read pass's record
+        {
+            SessionDeltaRecord bad = rec;
+            bad.kv_bytes[0][0] += 8;
+            check(!session_delta_apply(log.string(), 0, id, bad, sink, error), "delta: a structure change is refused");
+        }
+        fs::remove(log);
+        fs::remove(base);
+    }
+
     // the configuration fingerprint: every field counts, doubles by their exact bits
     {
         SessionConfig c;

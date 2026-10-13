@@ -171,6 +171,10 @@ struct SessionKvSource {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     std::array<size_t, 5> sizes{};
+    // --conversation-cache-disk-delta: the bytes of each part BEFORE this record's data.  sizes[part] stays the full
+    // part size; session_delta_write stores [first_bytes[part], sizes[part]) only.  Zero (the default, and what the
+    // plain session_file_write ignores) means the whole part.
+    std::array<size_t, 5> first_bytes{};
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
@@ -267,5 +271,53 @@ uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLi
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
+
+// ---- Delta records (--conversation-cache-disk-delta): append-only saves of one conversation.
+//
+// A chain is a base session file followed by zero or more delta records in one `.dlog` file beside it.  Every record
+// carries the state at one save (running state, the deepest checkpoint, the token/image ids) and only the K/V that
+// changed since the previous record: a conversation that grows (or a client that resends the same history) rewrites
+// a few tens of MiB instead of the whole 2+ GiB file.  The records are self-delimiting, hashed and bound to the same
+// model/config identity as session files; the caller keeps the committed length of the `.dlog` (a crash mid-append
+// leaves a torn record past it that no reader reaches, and the next append overwrites it).
+//
+// A record's layout, little-endian: magic 'STRSDLT\1', version, model, config, first_token, the same meta prefix as
+// a session file (geometry, layer range, cvec, the live checkpoint, the checkpoints), the K/V layer count and per
+// layer its header plus, for each part, `u64 offset`, `u64 size` and the bytes [offset, offset+size) - offset is the
+// byte within the full part where the record's data starts - then the payload hash and the 'STRSEND\1' end marker.
+struct SessionDeltaRecord {
+    int64_t first_token = 0;                          // the token the record's K/V starts at (informational)
+    SavedConversation meta;                           // live + checkpoints + K/V headers; the K/V buffers stay empty
+    std::vector<std::array<uint64_t, 5>> kv_offset;   // bytes skipped per layer/part (where the record's data goes)
+    std::vector<std::array<uint64_t, 5>> kv_bytes;    // bytes the record holds per layer/part
+};
+
+// Appends one record for `meta` + `kv` at `at` (the caller's committed length; the file is created if absent and cut
+// to `at` first, dropping an interrupted append's bytes).  kv[i].sizes are the full part sizes, kv[i].first_bytes the
+// offsets this record's data starts at.  `bytes` receives the record's length.  `durable` flushes the file before
+// returning, `phase`/`progress`/`fault` behave as in SessionWriteOptions.
+bool session_delta_write(const std::string& path, uint64_t at, const SavedConversation& meta,
+                         const std::vector<SessionKvSource>& kv, int64_t first_token, const SessionFileIdentity& id,
+                         uint64_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                         SessionStatus* status = nullptr);
+
+// Reads the record starting at `at` (< `limit`), validating its magic, version, identity, bounds and payload hash;
+// `next` is where the following record starts.  The K/V is not materialized: `out` gets the meta and each part's
+// (offset, size).  `status->error` is invalid for a torn/corrupt record, io/storage/memory otherwise.
+bool session_delta_read(const std::string& path, uint64_t at, uint64_t limit, const SessionFileIdentity& id,
+                        const SessionReadLimits& limits, SessionDeltaRecord& out, uint64_t& next, std::string& error,
+                        SessionStatus* status = nullptr);
+
+// The apply pass of one read record: re-reads it and hands its K/V blocks to `sink` at (offset + at within the
+// part), refusing a record whose structure differs from `expected` BEFORE a block is applied, and re-checking the
+// payload hash at the end.  As with session_file_apply_streamed, a failure after the first sink call leaves the
+// caller's state partly written: the caller must fail-stop.
+bool session_delta_apply(const std::string& path, uint64_t at, const SessionFileIdentity& id,
+                         const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
+                         SessionStatus* status = nullptr);
+
+// The bytes one record takes, for a sizing/preflight pass (saturating: `overflow` says the size does not fit).
+uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                                    bool* overflow = nullptr);
 
 } // namespace strata::core

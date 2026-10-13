@@ -22,6 +22,10 @@ struct ConversationSpillMatch {
     uint64_t file_bytes = 0;
     int64_t tokens = 0;
     bool live = false;
+    // --conversation-cache-disk-delta: with a chain, the delta log's committed length (`path` is its base) and the
+    // token count the chain's state holds (the last record's live ids).
+    uint64_t delta_committed = 0;
+    int64_t live_tokens = 0;
     explicit operator bool() const { return !path.empty() && tokens > 0; }
 };
 
@@ -50,7 +54,9 @@ public:
             const ConversationMatch match = conversation_metadata_match(entry.live_meta,
                     entry.checkpoint_lengths, prompt, images, cvec, entry.cvec, similarity, n_min);
             if (match.tokens > best_tokens)
-                best_tokens = match.tokens, best_match = {entry.session_path(), entry.file_bytes, match.tokens, match.live};
+                best_tokens = match.tokens,
+                best_match = {entry.session_path(), entry.file_bytes, match.tokens, match.live, entry.delta_bytes,
+                              (int64_t) entry.live_meta.ids.size()};
         }
         return best_match;
     }
@@ -69,6 +75,26 @@ public:
     // removes them and the disk budget evicts every ordinary conversation before one of them.
     bool spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, size_t& bytes,
                         std::string& error, bool durable = false, bool prefix = false);
+    // --conversation-cache-disk-delta: appends one delta record for an indexed entry instead of rewriting its file.
+    // `meta` + `kv` describe the conversation's current state; kv[i].sizes are full part sizes and first_bytes the
+    // offset each part's data starts at.  The record is written to the entry's `<stem>.dlog`, its committed length is
+    // published in `<stem>.dchain` (atomically) and then in the sidecar, so a crash between any two leaves the chain
+    // at its last committed record.  `bytes` is the record's length.  On success the entry's sidecar describes the
+    // new state.  A prefix entry or a disabled directory refuses.
+    bool spill_delta(size_t index, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                     int64_t first_token, size_t& bytes, std::string& error, bool durable = false);
+    // The index of the entry whose session file is `path`, or size() when none.
+    size_t find(const std::string& path) const;
+    // What a delta save needs to know about an entry (see generate.cpp): its token count, its deepest checkpoint,
+    // its file sizes and whether its live ids are a prefix of this conversation's tokens and images.  False for a
+    // prefix entry or an unknown index.
+    bool entry_info(size_t index, int64_t& tokens, int64_t& deepest, uint64_t& base_bytes, uint64_t& delta_bytes,
+                    bool& prefix, std::string& path) const;
+    // For a delta save: the entry's saved token ids (and images) match this state's first `n` tokens - the prefix
+    // the chain's K/V covers.  Only that prefix matters: a restore rewrites the tail, so the state may be shorter
+    // than the entry and still be a valid append target.
+    bool entry_matches_prefix(size_t index, const std::vector<int32_t>& ids, size_t n,
+                              const std::vector<ConversationImageKey>& images) const;
     // A prefix entry holding exactly these tokens (and images) is on disk already.
     bool has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
     size_t prefix_count() const;
@@ -88,12 +114,16 @@ private:
     struct Entry {
         std::filesystem::path stem;          // "<dir>/strata-conv-<serial>" (both files share it)
         uint64_t file_bytes = 0;
+        uint64_t delta_bytes = 0;            // committed bytes of "<stem>.dlog" (0: no chain)
         bool cvec = true;
         ConversationCheckpoint live_meta;    // ids + imgs only; no running state
         std::vector<size_t> checkpoint_lengths;
         bool prefix = false;                 // a persistent root entry (named strata-conv-prefix-N)
         std::string session_path() const { return (stem.string() + ".sess"); }
         std::string meta_path() const { return (stem.string() + ".meta"); }
+        std::string delta_path() const { return (stem.string() + ".dlog"); }
+        std::string chain_path() const { return (stem.string() + ".dchain"); }
+        uint64_t total_bytes() const { return file_bytes + delta_bytes; }
     };
     void enforce_budget();
     std::filesystem::path next_stem(bool prefix = false);
@@ -101,6 +131,10 @@ private:
                        std::string& error, bool prefix = false);
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
     bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
+    // The chain manifest beside <stem>.dlog: base size (must match the session file) and the committed length.
+    bool read_chain(const std::filesystem::path& chain, uint64_t base_size, const std::filesystem::path& dlog,
+                    uint64_t& committed, std::string& error) const;
+    bool write_chain(const std::filesystem::path& chain, uint64_t base_size, uint64_t committed, std::string& error) const;
 
     bool enabled_ = false;
     SessionFileIdentity identity_{};

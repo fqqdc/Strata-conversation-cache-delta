@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -324,6 +325,145 @@ int main() {
         check(tight.size() == 2, "prefix: budget evicted an ordinary conversation, not the prefix");
         check(tight.has_prefix(root.live.ids, {}, root.cvec), "prefix: dedupe sees the reopened prefix");
         fs::remove_all(pdir);
+    }
+
+    // --conversation-cache-disk-delta: a base session file plus an append log and its manifest are one entry.
+    // spill_delta appends the changed K/V and republishes the sidecar; the chain survives a reopen; erase, the
+    // budget and drop_superseded remove the chain files together; a chain that cannot be proven (short log, edited
+    // manifest) makes open() drop the whole entry rather than restore a state that does not match its sidecar.
+    {
+        const fs::path cdir = fs::temp_directory_path() / "strata_spill_delta_test";
+        fs::remove_all(cdir);
+        auto sources_of = [](const SavedConversation& img, size_t first) {
+            std::vector<SessionKvSource> sources;
+            for (const auto& k : img.kv) {
+                SessionKvSource src;
+                src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+                src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) {
+                    src.sizes[i] = parts[i]->size();
+                    src.first_bytes[i] = parts[i]->size() > first ? first : 0;
+                }
+                src.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+                sources.push_back(std::move(src));
+            }
+            return sources;
+        };
+        auto meta_of = [](SavedConversation img) { img.kv.clear(); return img; };
+        SavedConversation base = sample(1500);
+        SavedConversation grown = base;
+        // the ids continue the sample's (1000 + i): a checkpoint generator keeps matching them
+        for (int i = 0; i < 300; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        grown.checkpoints.push_back(checkpoint(1800, 8));
+
+        ConversationSpillCache ch;
+        size_t written = 0;
+        check(ch.open(cdir, id, 1ull << 30, error), "delta spill: open");
+        check(ch.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: base");
+        const uint64_t base_file = written;
+        const size_t index = ch.find(ch.newest_path());
+        check(index == 0, "delta spill: find by path");
+        int64_t tokens = 0, deepest = 0;
+        uint64_t info_base = 0, info_delta = 0;
+        bool is_prefix = true;
+        std::string path;
+        check(ch.entry_info(index, tokens, deepest, info_base, info_delta, is_prefix, path) && tokens == 1500 &&
+              info_base == base_file && info_delta == 0 && !is_prefix, "delta spill: entry info before the delta");
+        size_t delta_written = 0;
+        check(ch.spill_delta(index, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(),
+                             delta_written, error), "delta spill: append");
+        check(delta_written > 0, "delta spill: the record was written");
+        check(ch.entry_matches_prefix(index, grown.live.ids, grown.live.ids.size(), {}),
+              "delta spill: the entry covers the state's tokens");
+        // a state the restore rewrote shorter than the entry still appends: only the covered prefix counts
+        std::vector<int32_t> shorter(grown.live.ids.begin(), grown.live.ids.begin() + 1700);
+        check(ch.entry_matches_prefix(index, shorter, 1600, {}), "delta spill: a shorter rewritten state matches");
+        std::vector<int32_t> diverging = grown.live.ids;
+        diverging[700] = 12345;
+        check(!ch.entry_matches_prefix(index, diverging, grown.live.ids.size(), {}),
+              "delta spill: a diverged prompt is not a match");
+        check(ch.bytes() == base_file + delta_written, "delta spill: the budget counts the chain");
+        fs::path dlog(path), dchain(path);
+        dlog.replace_extension(".dlog");
+        dchain.replace_extension(".dchain");
+        check(fs::file_size(dlog) == delta_written, "delta spill: the log holds the record");
+        std::vector<int32_t> cont = grown.live.ids;
+        cont.push_back(7);
+        const auto hit = ch.best(cont, {}, grown.cvec, 0.0, 0);
+        check(bool(hit) && hit.tokens == (int64_t) grown.live.ids.size() && hit.delta_committed == delta_written &&
+              hit.live_tokens == (int64_t) grown.live.ids.size(), "delta spill: best() offers the chain");
+        // the chain is reindexed on a reopen (an engine restart), committed length included
+        ConversationSpillCache reopened;
+        check(reopened.open(cdir, id, 1ull << 30, error) && reopened.size() == 1, "delta spill: reopen keeps the entry");
+        const auto again = reopened.best(cont, {}, grown.cvec, 0.0, 0);
+        check(bool(again) && again.delta_committed == delta_written && again.path == hit.path,
+              "delta spill: the chain survives a reopen");
+        // erase removes the base, the log and the manifest together
+        check(reopened.erase(again.path, error) && reopened.size() == 0, "delta spill: erase removes the chain");
+        check(!fs::exists(path) && !fs::exists(dlog) && !fs::exists(dchain), "delta spill: no chain file left");
+
+        // a committed length past the log's bytes: the chain cannot be proven and the entry goes
+        const fs::path broken = fs::temp_directory_path() / "strata_spill_delta_broken";
+        fs::remove_all(broken);
+        {
+            ConversationSpillCache c1;
+            check(c1.open(broken, id, 1ull << 30, error), "delta spill: open broken-dir");
+            check(c1.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: broken base");
+            size_t w = 0;
+            check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: broken append");
+            fs::path d2 = c1.newest_path();
+            d2.replace_extension(".dlog");
+            fs::resize_file(d2, fs::file_size(d2) - 4);
+        }
+        ConversationSpillCache c2;
+        check(c2.open(broken, id, 1ull << 30, error) && c2.size() == 0, "delta spill: a short log drops the entry");
+        fs::remove_all(broken);
+        {
+            ConversationSpillCache c3;
+            check(c3.open(broken, id, 1ull << 30, error), "delta spill: reopen broken-dir");
+            check(c3.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: broken base 2");
+            size_t w = 0;
+            check(c3.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: broken append 2");
+            fs::path d3 = c3.newest_path();
+            d3.replace_extension(".dchain");
+            std::fstream f(d3, std::ios::binary | std::ios::in | std::ios::out);
+            char c = 0;
+            f.read(&c, 1);
+            c = char(c ^ 0x40);
+            f.seekp(0);
+            f.write(&c, 1);
+            f.close();
+        }
+        ConversationSpillCache c4;
+        check(c4.open(broken, id, 1ull << 30, error) && c4.size() == 0, "delta spill: an edited manifest drops the entry");
+        fs::remove_all(broken);
+
+        // a full write that supersedes the chain removes the chain files with it
+        {
+            ConversationSpillCache c5;
+            check(c5.open(cdir, id, 1ull << 30, error), "delta spill: open for the supersede test");
+            check(c5.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: base 2");
+            size_t w = 0;
+            check(c5.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: append 2");
+            fs::path d5 = c5.newest_path();
+            d5.replace_extension(".dlog");
+            check(fs::exists(d5), "delta spill: the chain is on disk");
+            SavedConversation longer = grown;
+            for (int i = 0; i < 200; ++i) longer.live.ids.push_back(int32_t(2800 + i));
+            longer.checkpoints.push_back(checkpoint((size_t) grown.live.ids.size(), 9));
+            size_t w2 = 0;
+            check(c5.spill_streamed(meta_of(longer), sources_of(longer, 0), w2, error), "delta spill: full write");
+            const std::string kept = c5.newest_path();
+            const size_t dropped = c5.drop_superseded(longer.live.ids, {}, longer.checkpoints, longer.cvec, kept);
+            check(dropped == 1, "delta spill: the old chain is superseded");
+            check(!fs::exists(d5) && !fs::exists(fs::path(d5.string().substr(0, d5.string().size() - 5) + ".dchain")),
+                  "delta spill: the superseded chain's files are gone");
+            fs::remove_all(cdir);
+        }
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

@@ -296,6 +296,36 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                         const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                         const QsaState& draft, int64_t unchanged_tokens, std::string& error) {
+    if (!conversation_snapshot_sources(meta, sources, view, ss, g, draft, error)) return false;
+    const int64_t upto = (int64_t) view.ids.size();
+    if (unchanged_tokens < 0 || unchanged_tokens > upto) {
+        error = "conversation snapshot: invalid unchanged prefix for a delta record";
+        return false;
+    }
+    const size_t layers = owned_qsa(ss);
+    for (size_t i = 0; i < sources.size(); ++i) {
+        const bool index = i < layers;
+        // the draft's final cell may not have been computed when the output cap was reached: refresh one token more
+        const int64_t kept = index ? unchanged_tokens : std::max<int64_t>(0, unchanged_tokens - 1);
+        SessionKvSource& s = sources[i];
+        const int64_t whole_cells = (kept / s.page_size) * s.page_size;
+        for (size_t part = 0; part < 5; ++part) {
+            const size_t keep = part == 4
+                ? (index ? size_t(kept / strata::kernels::qsa_real_shapes().idx_block) * (size_t) g.idx_key_dim * 4 : 0)
+                : (s.cells ? (s.sizes[part] / (size_t) s.cells) * size_t(whole_cells) : 0);
+            if (keep > s.sizes[part]) {
+                error = "conversation snapshot: delta K/V offset is past its part";
+                return false;
+            }
+            s.first_bytes[part] = keep;
+        }
+    }
+    return true;
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {
