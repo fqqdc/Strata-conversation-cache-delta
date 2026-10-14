@@ -31,8 +31,9 @@ struct ConversationSpillMatch {
 
 class ConversationSpillCache {
 public:
-    // Opens (creating if needed) the spill directory and indexes the conversations already in it. Files whose
-    // sidecar names another model/config identity, or whose session file is missing or unreadable, are removed.
+    // Opens (creating if needed) the spill directory and indexes the conversations already in it. Left-over write
+    // temporaries, unreadable or torn sidecars, files of another model/config identity (unrestorable after a model
+    // or setting change) and chains that do not prove out are removed; the rest stay and can be restored.
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
               std::string& error);
     bool enabled() const { return enabled_; }
@@ -98,6 +99,11 @@ public:
     // A prefix entry holding exactly these tokens (and images) is on disk already.
     bool has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
     size_t prefix_count() const;
+    // A successful restore is an access: stamps the entry as the most recently used (persisted in the sidecar, so
+    // the budget's eviction order - least recently used first - survives a restart).  Failures are not.
+    void touch(const std::string& path);
+    // The entry's persisted last-use stamp in milliseconds since the epoch (0: a v1 sidecar, unknown age).
+    uint64_t entry_last_used(size_t index) const;
     bool erase(const std::string& path, std::string& error);
     // A conversation being restored is held out of eviction until it is put back in RAM or dropped.
     void pin(const std::string& path);
@@ -115,6 +121,7 @@ private:
         std::filesystem::path stem;          // "<dir>/strata-conv-<serial>" (both files share it)
         uint64_t file_bytes = 0;
         uint64_t delta_bytes = 0;            // committed bytes of "<stem>.dlog" (0: no chain)
+        uint64_t last_used = 0;              // milliseconds since the epoch of the last save or successful restore
         bool cvec = true;
         ConversationCheckpoint live_meta;    // ids + imgs only; no running state
         std::vector<size_t> checkpoint_lengths;
@@ -141,7 +148,7 @@ private:
     uint64_t budget_ = 0, bytes_ = 0, serial_ = 0;
     size_t stale_files_wiped_ = 0, disk_evictions_ = 0;
     std::filesystem::path directory_;
-    std::vector<Entry> entries_;   // oldest spill first
+    std::vector<Entry> entries_;   // index order only; the budget evicts by Entry::last_used (least recent first)
     std::string pinned_path_;
 };
 

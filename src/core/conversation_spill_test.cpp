@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
 
@@ -91,6 +92,26 @@ int main() {
     check(spill.enabled(), "enabled");
     check(spill.size() == 0, "empty index");
 
+    // left-over write temporaries are wiped at open: a killed session write leaves a dot-prefixed file (up to the
+    // session's size), a killed sidecar or chain-manifest write leaves a <stem>.meta.tmp / <stem>.dchain.tmp
+    {
+        const fs::path tdir = fs::temp_directory_path() / "strata_spill_tmp_test";
+        fs::remove_all(tdir);
+        fs::create_directories(tdir);
+        { std::ofstream f(tdir / ".strata-conv-1.sess.0123456789abcdef.tmp", std::ios::binary); f << "junk"; }
+        { std::ofstream f(tdir / "strata-conv-2.meta.tmp", std::ios::binary); f << "junk"; }
+        { std::ofstream f(tdir / "strata-conv-3.dchain.tmp", std::ios::binary); f << "junk"; }
+        { std::ofstream f(tdir / "keep.txt", std::ios::binary); f << "keep"; }
+        ConversationSpillCache tc;
+        check(tc.open(tdir, id, 1ull << 30, error), "tmp: open");
+        check(!fs::exists(tdir / ".strata-conv-1.sess.0123456789abcdef.tmp"), "tmp: a session write's temporary is wiped");
+        check(!fs::exists(tdir / "strata-conv-2.meta.tmp"), "tmp: a sidecar temporary is wiped");
+        check(!fs::exists(tdir / "strata-conv-3.dchain.tmp"), "tmp: a chain manifest temporary is wiped");
+        check(tc.stale_files_wiped() == 3, "tmp: the wipes are counted");
+        check(fs::exists(tdir / "keep.txt"), "tmp: unrelated files stay");
+        fs::remove_all(tdir);
+    }
+
     SavedConversation a = sample(1000);
     check(spill.spill(a, error), "spill first");
     check(spill.size() == 1, "one entry");
@@ -142,15 +163,19 @@ int main() {
     const auto rematched = again.best(continuing, a.live.imgs, false, 0.0, 0);
     check(bool(rematched) && rematched.tokens == (int64_t) a.live.ids.size(), "rematch after reopen");
 
-    // a foreign identity is refused and its files removed
-    ConversationSpillCache foreign;
-    check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
-    check(foreign.size() == 0, "foreign identity: nothing indexed");
-    check(fs::exists(dir / "strata-conv-1.sess"), "another identity's files are left alone");
+    // a foreign model/config identity cannot be restored: its files are removed at open
+    {
+        ConversationSpillCache foreign;
+        check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
+        check(foreign.size() == 0, "foreign identity: nothing indexed");
+        check(!fs::exists(dir / "strata-conv-1.sess") && !fs::exists(dir / "strata-conv-1.meta"),
+              "another identity's files are removed");
+    }
 
     // budget eviction drops the oldest
     ConversationSpillCache tight;
     check(tight.open(dir, id, 1ull << 30, error), "open for budget test");
+    check(tight.spill(a, error), "spill the first conversation again");
     const uint64_t before = tight.bytes();
     SavedConversation b = sample(2000);
     check(tight.spill(b, error), "spill second");
@@ -464,6 +489,101 @@ int main() {
                   "delta spill: the superseded chain's files are gone");
             fs::remove_all(cdir);
         }
+    }
+
+    // the budget evicts the least recently used, not lexicographically-first: a restore's touch makes an old entry
+    // the newest, and the stamps survive a reopen (a v1 sidecar's unknown age sorts as the oldest)
+    {
+        const fs::path ldir = fs::temp_directory_path() / "strata_spill_lru_test";
+        fs::remove_all(ldir);
+        auto sources_of = [](const SavedConversation& img) {
+            std::vector<SessionKvSource> sources;
+            for (const auto& k : img.kv) {
+                SessionKvSource src;
+                src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+                src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) src.sizes[i] = parts[i]->size();
+                src.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+                sources.push_back(std::move(src));
+            }
+            return sources;
+        };
+        auto meta_of = [](SavedConversation img) { img.kv.clear(); return img; };
+        ConversationSpillCache lru;
+        check(lru.open(ldir, id, 1ull << 30, error), "lru: open");
+        SavedConversation c1 = sample(1000);
+        SavedConversation c2 = sample(1500);   // the largest: its eviction must free enough for the budget below
+        SavedConversation c3 = sample(900);
+        size_t w = 0, w1 = 0, w2 = 0, w3 = 0;
+        check(lru.spill_streamed(meta_of(c1), sources_of(c1), w, error), "lru: c1 saved");
+        const std::string p1 = lru.newest_path();
+        w1 = w;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(lru.spill_streamed(meta_of(c2), sources_of(c2), w, error), "lru: c2 saved");
+        const std::string p2 = lru.newest_path();
+        w2 = w;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(lru.spill_streamed(meta_of(c3), sources_of(c3), w, error), "lru: c3 saved");
+        const std::string p3 = lru.newest_path();
+        w3 = w;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        lru.touch(p1);   // c1 was used again - it is the newest now, though it was saved first
+        check(lru.entry_last_used(lru.find(p1)) > lru.entry_last_used(lru.find(p3)), "lru: a touch stamps the newest");
+        check(lru.bytes() == w1 + w2 + w3, "lru: the three are accounted");
+        // a budget that fits two of the three: reopening evicts c2, the least recently used
+        ConversationSpillCache reopened;
+        check(reopened.open(ldir, id, w1 + w3 + 16, error), "lru: reopen with a budget for two");
+        check(reopened.size() == 2, "lru: one entry evicted");
+        check(reopened.disk_evictions() >= 1, "lru: the eviction is counted");
+        check(reopened.find(p2) == reopened.size(), "lru: the least recently used one is gone");
+        check(reopened.find(p1) != reopened.size() && reopened.find(p3) != reopened.size(),
+              "lru: the touched and the newer one stay");
+        check(reopened.entry_last_used(reopened.find(p1)) > reopened.entry_last_used(reopened.find(p3)),
+              "lru: the last-use stamps are persisted");
+        fs::remove_all(ldir);
+    }
+
+    // a v1 sidecar (written before the last-use stamp existed) is still indexed and restorable; its unknown age
+    // sorts as the oldest, so an upgrade never drops the cache
+    {
+        const fs::path vdir = fs::temp_directory_path() / "strata_spill_v1_test";
+        fs::remove_all(vdir);
+        fs::create_directories(vdir);
+        SavedConversation v = sample(1000);
+        size_t w = 0;
+        check(session_file_write((vdir / "strata-conv-1.sess").string(), v, id, w, error), "v1: the session file");
+        {
+            std::ofstream out(vdir / "strata-conv-1.meta", std::ios::binary | std::ios::trunc);
+            SessionHasher h(0);
+            auto raw = [&](const void* p, size_t n) {
+                out.write(static_cast<const char*>(p), (std::streamsize) n);
+                h.update(p, n);
+            };
+            auto u64 = [&](uint64_t x) { raw(&x, 8); };
+            auto i64 = [&](int64_t x) { raw(&x, 8); };
+            raw("SCSM", 4);
+            u64(1);                        // the v1 version: no last-use stamp follows the checkpoint lengths
+            u64(id.model);
+            u64(id.config);
+            u64(v.cvec ? 1 : 0);
+            u64(v.live.ids.size());
+            for (int32_t x : v.live.ids) i64(x);
+            u64(v.live.imgs.size());
+            for (const auto& k : v.live.imgs) { i64(k.start); u64(k.hash); }
+            u64(v.checkpoints.size());
+            for (const auto& c : v.checkpoints) u64(c.ids.size());
+            u64(h.digest());
+        }
+        ConversationSpillCache v1;
+        check(v1.open(vdir, id, 1ull << 30, error), "v1: open keeps it");
+        check(v1.size() == 1, "v1: indexed");
+        check(v1.entry_last_used(0) == 0, "v1: the unknown age is 0");
+        const auto hit = v1.best(v.live.ids, v.live.imgs, v.cvec, 0.0, 0);
+        check(bool(hit), "v1: it matches");
+        SavedConversation back;
+        check(v1.load(hit.path, back, {}, error) && back.live.ids == v.live.ids, "v1: it loads back");
+        fs::remove_all(vdir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

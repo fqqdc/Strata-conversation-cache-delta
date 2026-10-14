@@ -7900,6 +7900,7 @@ int main(int argc, char** argv) {
                 size_t bytes = 0;
                 bool delta_written = false;
                 std::string kept;
+                const size_t evictions_before = conversation_spill.disk_evictions();
                 // --conversation-cache-disk-delta: when this conversation came from a chain on disk and its K/V
                 // prefix still matches that chain, append only the K/V from the first changed page on.  Any doubt
                 // (no chain, evicted, another conversation's state, an overgrown log) writes the whole file instead.
@@ -7922,10 +7923,16 @@ int main(int argc, char** argv) {
                             if (overflow) {
                                 std::fprintf(stderr, "strata serve: conversation cache: delta save skipped (the state "
                                              "is too large for this build); writing the whole file\n");
-                            } else if (chain_delta + estimate > compact_at) {
+                            } else if (chain_delta + estimate > compact_at && chain_delta > 0) {
                                 std::fprintf(stderr, "strata serve: conversation cache: delta chain holds %llu of "
                                              "%llu MiB; compacting into a new file\n",
                                              (unsigned long long) (chain_delta >> 20), (unsigned long long) (compact_at >> 20));
+                            } else if (chain_delta + estimate > compact_at) {
+                                // the first record alone is over the chain limit: the state arrays dominate the file
+                                // (short conversations), so the whole file is no larger than the chain would be
+                                std::fprintf(stderr, "strata serve: conversation cache: delta record would be %llu MiB "
+                                             "over the %llu MiB chain limit; writing the whole file\n",
+                                             (unsigned long long) (estimate >> 20), (unsigned long long) (compact_at >> 20));
                             } else {
                                 size_t written = 0;
                                 if (conversation_spill.spill_delta(index, meta, sources, (int64_t) live.size(), written,
@@ -7966,10 +7973,11 @@ int main(int argc, char** argv) {
                 disk_kv_prefix = (int64_t) live.size();
                 disk_chain_path = kept;
                 std::fprintf(stderr, "strata serve: conversation cache: disk-saved %zu tokens (%zu MiB, %s) in %.1f ms; "
-                             "%zu older cop%s dropped; disk=%zu MiB in %zu files\n", live.size(), bytes >> 20,
+                             "%zu older cop%s dropped; disk=%zu MiB in %zu files; evicted=%zu\n", live.size(), bytes >> 20,
                              delta_written ? "delta" : why,
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), dropped,
-                             dropped == 1 ? "y" : "ies", (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
+                             dropped == 1 ? "y" : "ies", (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size(),
+                             conversation_spill.disk_evictions() - evictions_before);
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (allocation failed)\n");
             }
@@ -10538,6 +10546,7 @@ int main(int argc, char** argv) {
                                     parked = {0, disk_match.tokens, disk_match.live};
                                     incoming_from_disk = true;
                                     incoming_disk_path = disk_match.path;
+                                    conversation_spill.touch(disk_match.path);   // a hit is an access: it is the LRU order's newest
                                 }
                             }
                         }
@@ -10710,6 +10719,7 @@ int main(int argc, char** argv) {
                         // --conversation-cache-disk-delta: this live conversation can append to the chain it came from
                         disk_kv_prefix = resume;
                         disk_chain_path = disk_in_path;
+                        conversation_spill.touch(disk_in_path);   // a hit is an access: it is the LRU order's newest
                     }
                 }
                 conversation_spill.unpin(disk_in_path);   // the file stays: a later save of this conversation supersedes it
