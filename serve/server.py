@@ -68,6 +68,8 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+# the config-driven one-shot markers (see oneshot_rules.py)
+from serve import oneshot_rules as oneshot  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -840,6 +842,13 @@ class StrataEngine:
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
         self.last_err = None
+        # the one-shot markers (config-driven; off until main() reads
+        # the config), and what each rule marked this run.  ONLY WHEN ABSENT: restart() re-runs
+        # __init__ to start a lazily-loaded engine, and a plain assignment here would wipe the rule
+        # set main() attached - measured: the engine then served every request unmarked.
+        if not hasattr(self, "oneshot_markers"):
+            self.oneshot_markers = oneshot.Markers()
+            self.oneshot_marked: dict[str, int] = {}
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -1181,6 +1190,42 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    # a conversation switched away from in --conversation-cache-disk-only
+    # mode is streamed to the spill directory.  Some requests are one-shot by construction (a session-title
+    # call, a Codex compaction, anything a client declares), so writing their state is pure waste - measured
+    # on this machine: a 130-token title call wrote a 226 MiB file, twice per session.  The engine cannot
+    # tell (at save time it only has tokens), so the serve side marks the request with `ckpt=0`, which
+    # already means "this turn is not continued, not parked and in disk mode not saved, while a cached
+    # prefix is still reused".  Which requests are one-shot is read from the run config's
+    # `oneshot_markers` block (see oneshot_rules.py): adding a marker is a config edit, not a code change.
+    def mark_one_shot(self, sampling, ids=None):
+        """-> the sampling dict this request goes to the engine with, possibly carrying `ckpt=0`.
+
+        Off, or no rule matches -> the dict is returned untouched, so the default path stays exactly
+        what it was.  A rule that hits sets the same field a client would send itself
+        (`strata_checkpoint: false`), which `sampling_keys()` already turns into `ckpt=0`.
+        """
+        markers = getattr(self, "oneshot_markers", None)
+        if markers is None or not markers.enabled or not markers.rules:
+            return sampling
+        try:
+            hits, key = oneshot.decision(markers, sampling or {}, ids)
+        except Exception as error:                    # a rule must never fail a request
+            print(f"[strata] oneshot markers: rule evaluation failed ({error}); "
+                  f"the request is sent unmarked", flush=True)
+            return sampling
+        if not hits:
+            return sampling
+        marked = dict(sampling or {})
+        marked[key] = False
+        self.oneshot_marked.update({rule_id: self.oneshot_marked.get(rule_id, 0) + 1 for rule_id in hits})
+        if markers.log:
+            size = len(json.dumps(marked, default=str).encode("utf-8", "replace")) \
+                if isinstance(marked, dict) else 0
+            print(f"[strata] oneshot markers: marked by {', '.join(hits)} - "
+                  f"{len(ids) if ids is not None else '?'} prompt tokens, body {size} B -> ckpt=0", flush=True)
+        return marked
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1911,6 +1956,7 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        sampling = self.mark_one_shot(sampling, ids)     # one-shot markers: a no-op when the config has none
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
@@ -6674,6 +6720,19 @@ def default_model_name(cfg: dict) -> str:
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
 
 
+def _oneshot_encoder(tok):
+    """The encoder a SYSTEM_TEXT marker rule needs - the model's own
+    tokenizer, so the rule's text becomes the token ids the prompt will actually start with.  Without
+    one (the mock engine, or a tokenizer that cannot encode it) the caller drops that rule."""
+    if tok is None or not hasattr(tok, "encode"):
+        return None
+
+    def encode(text: str) -> list[int]:
+        return list(tok.encode(text, parse_special=True))
+
+    return encode
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -6852,6 +6911,22 @@ def main() -> int:
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
+    # the one-shot markers.  A bad block stops the server here, at
+    # startup, with the reason - it must never be a per-request surprise.  A rule whose text cannot be
+    # prepared (no tokenizer, an encoder that refuses it) is dropped with a note instead: a config
+    # problem must not keep the server from starting, and a dropped rule only means "no marking".
+    try:
+        svc.oneshot = oneshot.parse(cfg.get("oneshot_markers"))
+    except oneshot.MarkerConfigError as e:
+        raise SystemExit(f"[strata] config {e}") from None
+    svc.oneshot, oneshot_notes = oneshot.prepare_text_rules(svc.oneshot, _oneshot_encoder(tok))
+    for line in list(oneshot.describe(svc.oneshot)) + oneshot_notes:
+        print(f"[strata] {line}", flush=True)
+    # the engines evaluate the rules (they are the ones that see the prompt ids); with --replicas
+    # every replica gets the same rule set, so a request is marked whichever one serves it
+    for eng in [svc.engine, *getattr(svc.engine, "engines", [])]:
+        if eng is not None:
+            eng.oneshot_markers = svc.oneshot
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
