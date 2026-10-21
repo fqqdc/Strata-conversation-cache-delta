@@ -140,7 +140,14 @@
 - **引擎**：`START-HERE.bat --setup --build --family qwen --model IQ3_XXS --context 262144 --kv q4_0 --vision gpu --gguf-dir "<GGUF 目录>" --no-start --yes`
   产物 `engine\strata.exe`（+`strata-vision.exe`）。注意别把 setup 默认写入的 `--kv-resident` 留在配置里。
 - **CPU 单测**（vcvars64 + Ninja）：`cmake -S . -B build-tests -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_GGML_DIR=<ws>\third_party\llama.cpp`，
-  构建并运行 `conversation_spill_test`、`conversation_file_test`、`conversation_cache_test`（当前 129/223/4214 全绿）。
+  构建并运行 `conversation_cache_test`、`conversation_file_test`、`conversation_spill_test`、`conversation_memory_test`、
+  `conversation_split_failure_test`、`session_save_reclaim_test`（v0.2.2 / 0.1.47 合并后本机实测
+  4772 / 223 / 129 / 25 / 全过 / 119 全绿；`cmake --build build-tests` 前先 call VS 2022 BuildTools 的 `vcvars64.bat`，
+  否则 cl 找不到标准库头）。
+- **上游合并（2026-10-21，v0.2.2 `011c9e60` → `f2f95b24`）**：上游 943+ 个提交没有动会话缓存子系统
+  （`conversation_*` 的 blob 全同）；冲突只有 `CMakeLists.txt`（把 `src/core/conversation_spill.cpp` 和
+  `conversation_spill_test` 加回）与 `serve/server.py`（`_oneshot_encoder` 拼到上游新 `main()` 之前）。
+  引擎 0.1.47 下盘上缓存实测：226 MiB 切换写 177–770 ms、读回 216–260 ms（read pass 76–92 ms）。
 - **场景脚本**（`scenario-1480.py`、`test-delta-restart.py`、`test-lru-live.py` 等）本地已删，
   可从本地备份分支取回：`git show disk-only-cache:scenario-1480.py > scenario-1480.py`（CSV/其余脚本同理）。
   测试要按「重发相同历史 / 追加」设计（见 §3.1 匹配语义）。

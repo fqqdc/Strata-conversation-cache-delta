@@ -93,7 +93,7 @@ follow it whether a person or an agent writes the text. The short version:
 
 - RTX 5070 Ti 16 GB（sm_120，驱动 616.56）、Ryzen 9 9950X（AVX-512）、62 GB RAM、Windows 11。
 - 本 fork 生产目录：`F:\Users\Emanon\Desktop\opencode workspace\Strata-1480`（分支 `conversation-cache-delta`，
-  合并上游 v0.1.45 的提交 `2a32c037`）；数据目录 `...\opencode workspace\Strata-data`（`packs\iq3_xxs`、`mtp\rt`）。
+  合并上游 v0.1.45 的提交 `2a32c037`、v0.2.2 的提交 `f2f95b24`）；数据目录 `...\opencode workspace\Strata-data`（`packs\iq3_xxs`、`mtp\rt`）。
 - GGUF 在 `D:\Program Files\LM Studio Files\models\ISTA-DASLab\Qwen3.8-Flash-Next-GSQ-RCO-GGUF\`：配置直接引用，**不要移动/删除**。
 
 ### 当前生产配置（`strata-iq3_xxs.json`）
@@ -103,10 +103,10 @@ follow it whether a person or an agent writes the text. The short version:
 - K/V：`--kv q4_0`，`--kv-resident 32768`——每个 QSA 层 32K cell 常驻 VRAM，其余流式放内存
   （启动日志：`32768 of 524288 cells per QSA layer in VRAM, the K/V in 3.38 GiB of pinned RAM`）。
 - 图片：`--vision`（GPU 编码器，`vision.max_tokens 1024`，复用本地 `mmproj-Qwen3.8-Flash-Next-BF16.gguf`，无需下载）。
-- 性能：`--expert-cache auto`（本机约 3512 槽）、`--prefill auto`、`--spec 4 --spec-min-p 0.5`、
+- 性能：`--expert-cache auto`（0.1.45 约 3512 槽，0.1.47 实测 3485 槽）、`--prefill auto`、`--spec 4 --spec-min-p 0.5`、
   `--mtp Strata-data\mtp\rt`、`--expert-profile data\expert-profile.bin`。
 - 显存：`--vram-reserve-mib 1548`（手动调过；setup 默认写 700——旧记录实测 256K 时加载后只剩 ~176 MiB 并报 LOW，512K 只会更紧）。
-  512K 加载完实测空闲 ~1035 MiB（日志 `1035 MiB of VRAM free with everything loaded`）。
+  512K 加载完实测空闲 ~1035 MiB（0.1.45）/ ~1065 MiB（0.1.47），日志 `… MiB of VRAM free with everything loaded`。
 - 对话缓存（本 fork 的核心差异；**disk-only，没有 `--conversation-cache-mib`**）：
   `--conversation-cache-disk-only --conversation-cache-disk-delta`
   `--conversation-cache-spill-dir D:\strata-conv-disk --conversation-cache-disk-mib 32768 --conversation-cache-min-free-mib 512`
@@ -122,17 +122,25 @@ follow it whether a person or an agent writes the text. The short version:
 
 ### 引擎与构建
 
-- `engine\strata.exe` = **0.1.45**（合并上游 v0.1.45 后的 `build\strata.exe`，SHA256 `3B5C9A37…`）；
-  `engine\BUILD.json` 的 `version` 也是 0.1.45。`engine\strata-vision.exe` 仍是 0.1.44.1 构建——合并没有动
-  `tools/vision`，`vision_src` 未变，可以继续用。
-- 部署前备份：`engine\backup-0.1.44.1\`（strata.exe / strata-vision.exe / BUILD.json）。
+- `engine\strata.exe` = **0.1.47**（合并上游 v0.2.2 后的 `build\strata.exe`，SHA256 `4CF1E3A0…`）；
+  `engine\BUILD.json` 的 `version` 也是 0.1.47，`src` = `7cc533c92ea3819a`。`engine\strata-vision.exe` 仍是
+  0.1.44.1 构建——上游 0.2.2 改过 `tools/vision`，但旧 exe 与 0.1.47 engine/server 实测能正常读图（2026-10-21），
+  `vision_src` 保留旧值 `13d9deaf827f14ef`（setup 若要重建 vision 会重建）。
+- 合并记录：2026-10-21 合并上游 v0.2.2（`011c9e60`，943+ 个提交）为 `f2f95b24`；上游没动会话缓存子系统，
+  冲突只有 `CMakeLists.txt`（源列表补回 `conversation_spill.cpp`）和 `serve/server.py`（`_oneshot_encoder`
+  接在上游新的 `main()`/组件函数之前）。sm_120 的 5 个解码开关（`SIDE_MIXER=2` 等）在本机默认打开；
+  `PF_FUSED` 需 ≥80 SM，70 SM 不触发。
+- 部署前备份：`engine\backup-0.1.45-pre-merge-0.2.1\`（0.1.45 的 strata.exe / strata-vision.exe / BUILD.json）、
+  `engine\backup-0.1.44.1\`。旧 spill 缓存备份在 `D:\strata-conv-disk-0.1.45-backup`（28.2 GiB，切版前移出）。
 - 从源码重编（Ninja + MSVC 18 + CUDA 13.3，`CMAKE_CUDA_ARCHITECTURES=120`）：
   `cmd /c "call \"D:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat\" >nul && cmake --build build --target strata"`
   产物 `build\strata.exe`。**不要**跑全量 `cmake --build build`：上游 `src/kernels/hc_persist_parity.cpp` 在 Windows
   用了 POSIX `setenv/unsetenv`，会报 C3861。
 - 单测：`build-tests`（CUDA OFF、`STRATA_BUILD_CONVERSATION_TESTS=ON`）：`conversation_cache_test` 4772 项、
   `conversation_file_test` 223、`conversation_spill_test` 129、`conversation_memory_test` 25、
-  `conversation_split_failure_test` 全过（0.1.45 合并后本机实测）。
+  `conversation_split_failure_test` 全过、`session_save_reclaim_test` 119 项（v0.2.2 合并后本机实测）。
+- Python 测试（无 pytest，用 unittest）：`.venv\Scripts\python.exe -m unittest serve.test_oneshot_rules serve.test_monitor`
+  → 78 项全过（v0.2.2 合并后本机实测；`serve/web/app.js` 用 `node --check` 通过）。
 - 部署：确认没有 `strata.exe` 在跑 → `Copy-Item build\strata.exe engine\strata.exe -Force` → 更新
   `engine\BUILD.json` 的 `version`/`src` → 重启 server。引擎在跑时不能重编（链接器要写同一个 exe）。
 
@@ -145,13 +153,18 @@ follow it whether a person or an agent writes the text. The short version:
 
 ### 版本与缓存兼容（重要）
 
-- 会话文件身份包含 `STRATA_VERSION`：换引擎版本 = 旧 spill 目录按异身份作废。0.1.45 首次启动实测
-  `spill dir ready (0 conversations, 0 MiB, 13 stale files wiped, 0 disk evictions)`，约 16 GB 旧缓存被清，冷启动一次。
-- 回滚旧引擎不会找回旧缓存（已被清）；回滚 = 换回 `engine\strata.exe` + `BUILD.json` + 重启。
+- 会话文件身份包含 `STRATA_VERSION`：换引擎版本 = 旧 spill 目录按异身份作废。0.1.45 首次启动清过 16 GB；
+  升 0.1.47（v0.2.2）前把 28.2 GiB 生产缓存移到 `D:\strata-conv-disk-0.1.45-backup`，新目录冷启动
+  `spill dir ready (0 conversations, 0 MiB, 0 stale files wiped, 0 disk evictions)`。
+- 回滚旧引擎不会找回旧缓存（已被清）；回滚 = 换回 `engine\strata.exe` + `BUILD.json` + 重启，
+  需要旧缓存时把 `D:\strata-conv-disk-0.1.45-backup` 改名回 `D:\strata-conv-disk`。
 - sidecar 仍是 v2；彻底清缓存 = 停服后删 `D:\strata-conv-disk\*`。
 
 ### 更新流程
 
+- 手动合并上游：`git fetch origin main --tags`（直连约 40 KB/s；增量 <100 MB 时可用
+  `git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 fetch origin main --tags`）→
+  `git merge --no-ff <sha>`。合并前先提交/备份本机改动（AGENTS.md 曾被上游重写覆盖过一次）。
 - `UPDATE.bat` / `setup.py --update` 先 `git pull --ff-only`，而 AGENTS.md 常驻本地修改 → 会被拒：
   先 `git stash push`，更新完 `git stash pop`。
 - `--setup` 重跑会重写 config（丢掉 `--vram-reserve-mib 1548`、`--kv-resident 32768` 和全部 disk-only 参数），必须按上面的配置补回。
