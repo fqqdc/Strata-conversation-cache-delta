@@ -253,16 +253,20 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // must not go on.  An atomic replacement that is itself self-consistent and keeps the same sizes is NOT detected:
 // the file must have no writer but this engine.  Peak RAM: two 16 MiB buffers and `meta`.
 //
+// `payload_hash` (optional) receives the payload digest this walk computed: the read pass on success, the apply
+// pass on success and on a trailer mismatch (so a caller can compare the two passes and tell a torn re-read from a
+// file that really changed).  It is left untouched before the payload is walked.
+//
 // `layer` counts as the save wrote them (main layers, then the draft); `part` 0..4 is k, v, k_scale, v_scale,
 // pooled; `offset` is within the part.
 using SessionKvBlock = std::function<bool(size_t layer, size_t part, uint64_t offset, const void* data, size_t n)>;
 bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
                                 size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                                 std::vector<std::array<uint64_t, 5>>* kv_part_bytes = nullptr,
-                                SessionStatus* status = nullptr);
+                                SessionStatus* status = nullptr, uint64_t* payload_hash = nullptr);
 bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
-                                 SessionStatus* status = nullptr);
+                                 SessionStatus* status = nullptr, uint64_t* payload_hash = nullptr);
 // The RAM preflight of the streaming read of a `file_bytes` file: the two block buffers, the small vectors and the
 // running-state metadata the limits admit; the K/V itself stays on disk.
 uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);

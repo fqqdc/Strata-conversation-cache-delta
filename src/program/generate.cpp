@@ -131,6 +131,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -151,6 +152,21 @@ bool under_wddm() {
     static const bool dxg = std::filesystem::exists("/dev/dxg");
     return dxg;
 #endif
+}
+
+// A wall-clock stamp for the restore diagnostics: the engine log has no per-line time, and a torn read has to be
+// placed against the cache writes around it.
+std::string log_time_now() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32] = {};
+    if (std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", &tm) == 0) return "?";
+    return buf;
 }
 
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
@@ -11852,6 +11868,7 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;   // running state + K/V headers; the K/V buffers stay empty
                     std::vector<std::array<uint64_t, 5>> file_kv;   // the K/V sizes exactly as the read pass parsed them
                     size_t bytes = 0;
+                    uint64_t read_hash = 0, apply_hash = 0;   // the two passes' payload hashes (torn-read diagnosis)
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
@@ -11875,7 +11892,8 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_read_streamed(path, id, image, bytes, err, limits, &file_kv, &st)) {
+                        if (!strata::core::session_file_read_streamed(path, id, image, bytes, err, limits, &file_kv, &st,
+                                                                     &read_hash)) {
                             refuse(err, st.error);
                             continue;
                         }
@@ -11926,33 +11944,83 @@ int main(int argc, char** argv) {
                         return targets[layer].apply(part, offset, data, n, err);
                     };
                     strata::core::SessionStatus st2;
-                    if (!strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2)) {
+                    if (!strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2, &apply_hash)) {
                         if (!touched) {
                             // the file changed or failed before the first block: the session is as it was
                             live_ok = true;
                             refuse(err, st2.error);
                             continue;
                         }
-                        // some of the K/V is written: never decode from a partial state; the server starts again
-                        std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(), err.c_str());
-                        std::printf("FATAL restoring the session file failed after the device state was changed: %s\n", err.c_str());
-                        std::fflush(stdout);
-                        return 1;
+                        // Some of the K/V is written.  A torn re-read is transient: re-read the file once and, if it
+                        // still hashes as the read pass did, re-apply it over the partial write.  A different hash
+                        // (the file really changed) or a failed re-read still ends the engine.
+                        strata::core::SavedConversation recheck;
+                        size_t recheck_bytes = 0;
+                        std::string recheck_err;
+                        strata::core::SessionStatus recheck_st;
+                        std::vector<std::array<uint64_t, 5>> recheck_parts;
+                        uint64_t recheck_hash = 0;
+                        const bool recheck_ok = strata::core::session_file_read_streamed(
+                            path, id, recheck, recheck_bytes, recheck_err, {}, &recheck_parts, &recheck_st, &recheck_hash);
+                        std::fprintf(stderr,
+                                     "strata serve: %s session restore check: apply failed after a partial K/V write: "
+                                     "%s (file %s, %zu bytes, read hash 0x%016llx, apply hash 0x%016llx, re-read %s, "
+                                     "re-read hash 0x%016llx)\n",
+                                     log_time_now().c_str(), err.c_str(), path.c_str(), bytes,
+                                     (unsigned long long) read_hash, (unsigned long long) apply_hash,
+                                     recheck_ok ? "ok" : recheck_err.c_str(), (unsigned long long) recheck_hash);
+                        bool retry_ok = false;
+                        if (recheck_ok && read_hash != 0 && recheck_hash == read_hash) {
+                            std::fprintf(stderr,
+                                         "strata serve: %s session restore check: the file still hashes as the read "
+                                         "pass did -> retrying the apply pass\n", log_time_now().c_str());
+                            err.clear();
+                            retry_ok = strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2,
+                                                                                &apply_hash);
+                            if (retry_ok) {
+                                std::fprintf(stderr,
+                                             "strata serve: %s session restore check: retry succeeded (apply hash "
+                                             "0x%016llx)\n",
+                                             log_time_now().c_str(), (unsigned long long) apply_hash);
+                            } else {
+                                std::fprintf(stderr,
+                                             "strata serve: %s session restore check: retry failed: %s\n",
+                                             log_time_now().c_str(), err.c_str());
+                            }
+                        }
+                        if (!retry_ok) {
+                            std::fprintf(stderr,
+                                         "ERR restoring the session file failed after the device state was changed: %s\n",
+                                         err.c_str());
+                            std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                        err.c_str());
+                            std::fflush(stderr);
+                            std::fflush(stdout);
+                            return 1;
+                        }
                     }
                     for (auto& t : targets)
                         if (!t.finish(err)) {
                             std::fprintf(stderr, "strata serve: session restore %s: residency refill failed: %s\n",
                                          path.c_str(), err.c_str());
+                            std::fprintf(stderr,
+                                         "ERR restoring the session file failed after the device state was changed: %s\n",
+                                         err.c_str());
                             std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
                                         err.c_str());
+                            std::fflush(stderr);
                             std::fflush(stdout);
                             return 1;
                         }
                     if (!strata::core::conversation_checkpoint_restore(image.live, ss, g, err)) {
                         std::fprintf(stderr, "strata serve: session restore %s: running-state restore failed: %s\n",
                                      path.c_str(), err.c_str());
+                        std::fprintf(stderr,
+                                     "ERR restoring the session file failed after the device state was changed: %s\n",
+                                     err.c_str());
                         std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
                                     err.c_str());
+                        std::fflush(stderr);
                         std::fflush(stdout);
                         return 1;
                     }
@@ -12396,6 +12464,7 @@ int main(int argc, char** argv) {
             int64_t disk_in_tokens = 0;
             bool disk_in_live = false;
             double disk_read_ms = 0;
+            uint64_t disk_read_hash = 0, disk_apply_hash = 0;   // the two disk passes' payload hashes (torn-read check)
             if (disk_only && !disk_match.path.empty() && disk_match.tokens > std::max(resume, slot_tokens)) {
                 const auto td = Clock::now();
                 try {
@@ -12426,13 +12495,15 @@ int main(int argc, char** argv) {
                         disk_records.clear();
                         disk_record_at.clear();
                         disk_chain_bytes = 0;
+                        disk_read_hash = 0;
                         if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
                                 (uint64_t) o.max_context, max_checkpoints, le)) {
                             st.error = strata::core::SessionError::memory;   // a runtime limit, not the file: keep it
                             return false;
                         }
                         if (!strata::core::session_file_read_streamed(disk_match.path, spill_identity, disk_meta,
-                                                                      disk_in_bytes, le, limits, &disk_file_kv, &st))
+                                                                      disk_in_bytes, le, limits, &disk_file_kv, &st,
+                                                                      &disk_read_hash))
                             return false;
                         // --conversation-cache-disk-delta: the base plus every committed record.  The last record
                         // holds the state the sidecar (and so the match) describes; the base holds the K/V its own
@@ -12752,15 +12823,64 @@ int main(int argc, char** argv) {
                     };
                     strata::core::SessionStatus st2;
                     bool restored_ok = strata::core::session_file_apply_streamed(disk_in_path, spill_identity, sink,
-                                                                                disk_file_kv, err, &st2);
+                                                                                disk_file_kv, err, &st2, &disk_apply_hash);
                     // --conversation-cache-disk-delta: then every record, in order (each overwrites from its offset)
                     for (size_t ri = 0; restored_ok && ri < disk_records.size(); ++ri)
                         restored_ok = strata::core::session_delta_apply(disk_delta_path, disk_record_at[ri],
                                                                         spill_identity, disk_records[ri], sink, err, &st2);
+                    if (!restored_ok && touched) {
+                        // A torn re-read is transient: read the file once more and, if it still hashes as the read pass
+                        // did, re-apply it over the partial write.  A different hash (the file really changed) or a
+                        // failed re-read still ends the engine: never decode from a partial K/V.
+                        strata::core::SavedConversation recheck;
+                        size_t recheck_bytes = 0;
+                        std::string recheck_err;
+                        strata::core::SessionStatus recheck_st;
+                        std::vector<std::array<uint64_t, 5>> recheck_parts;
+                        uint64_t recheck_hash = 0;
+                        const bool recheck_ok = strata::core::session_file_read_streamed(
+                            disk_in_path, spill_identity, recheck, recheck_bytes, recheck_err, {}, &recheck_parts,
+                            &recheck_st, &recheck_hash);
+                        std::fprintf(stderr,
+                                     "strata serve: %s disk cache restore check: apply failed after a partial K/V write: "
+                                     "%s (file %s, %zu bytes, %zu layer(s), %zu delta record(s), read hash 0x%016llx, "
+                                     "apply hash 0x%016llx, re-read %s, re-read hash 0x%016llx)\n",
+                                     log_time_now().c_str(), err.c_str(), disk_in_path.c_str(), disk_in_bytes,
+                                     disk_file_kv.size(), disk_records.size(), (unsigned long long) disk_read_hash,
+                                     (unsigned long long) disk_apply_hash, recheck_ok ? "ok" : recheck_err.c_str(),
+                                     (unsigned long long) recheck_hash);
+                        if (recheck_ok && disk_read_hash != 0 && recheck_hash == disk_read_hash) {
+                            std::fprintf(stderr,
+                                         "strata serve: %s disk cache restore check: the file still hashes as the "
+                                         "read pass did -> retrying the apply pass\n", log_time_now().c_str());
+                            err.clear();
+                            restored_ok = strata::core::session_file_apply_streamed(
+                                disk_in_path, spill_identity, sink, disk_file_kv, err, &st2, &disk_apply_hash);
+                            for (size_t ri = 0; restored_ok && ri < disk_records.size(); ++ri)
+                                restored_ok = strata::core::session_delta_apply(
+                                    disk_delta_path, disk_record_at[ri], spill_identity, disk_records[ri], sink, err,
+                                    &st2);
+                            if (restored_ok) {
+                                std::fprintf(stderr,
+                                             "strata serve: %s disk cache restore check: retry succeeded (apply hash "
+                                             "0x%016llx)\n",
+                                             log_time_now().c_str(), (unsigned long long) disk_apply_hash);
+                            } else {
+                                std::fprintf(stderr,
+                                             "strata serve: %s disk cache restore check: retry failed: %s\n",
+                                             log_time_now().c_str(), err.c_str());
+                            }
+                        }
+                    }
                     if (!restored_ok) {
                         if (touched) {
+                            std::fprintf(stderr,
+                                         "ERR restoring a disk conversation failed after the device state was changed: %s\n",
+                                         err.c_str());
                             std::printf("ERR restoring a disk conversation failed after the device state was changed: %s\n",
                                         err.c_str());
+                            std::fflush(stderr);
+                            std::fflush(stdout);
                             return 1;
                         }
                         std::fprintf(stderr, "strata serve: conversation cache: disk hit skipped (%s)\n", err.c_str());
@@ -12770,11 +12890,19 @@ int main(int argc, char** argv) {
                     } else {
                         for (auto& t : targets)
                             if (!t.finish(err)) {
+                                std::fprintf(stderr,
+                                             "ERR restoring a disk conversation: residency refill failed: %s\n", err.c_str());
                                 std::printf("ERR restoring a disk conversation: residency refill failed: %s\n", err.c_str());
+                                std::fflush(stderr);
+                                std::fflush(stdout);
                                 return 1;
                             }
                         if (!strata::core::conversation_checkpoint_restore(disk_meta.live, ss, g, err)) {
+                            std::fprintf(stderr,
+                                         "ERR restoring a disk conversation: running-state restore failed: %s\n", err.c_str());
                             std::printf("ERR restoring a disk conversation: running-state restore failed: %s\n", err.c_str());
+                            std::fflush(stderr);
+                            std::fflush(stdout);
                             return 1;
                         }
                         live = std::move(disk_meta.live.ids);

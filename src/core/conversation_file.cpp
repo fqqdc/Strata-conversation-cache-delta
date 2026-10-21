@@ -1478,7 +1478,8 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
 // conversation_file.hpp).  The apply pass re-walks the same file with a sink, bound by the K/V sizes recorded here.
 bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
                       size_t& bytes, std::string& error, const SessionReadLimits& limits,
-                      std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus& st) {
+                      std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus& st,
+                      uint64_t* payload_hash) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;
@@ -1504,6 +1505,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (payload_hash) *payload_hash = in.hash.digest();
     meta = std::move(parsed);
     bytes = (size_t) rf.size;
     st.error = SessionError::none;
@@ -1517,7 +1519,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
 // the first sink call leaves the caller's state partly written - the caller must fail-stop.
 bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                        const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
-                       SessionStatus& st) {
+                       SessionStatus& st, uint64_t* payload_hash) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;
@@ -1534,6 +1536,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
     uint64_t ph = 0;
     std::memcpy(&ph, t, 8);
+    if (payload_hash) *payload_hash = in.hash.digest();   // set on the mismatch too: the caller compares the passes
     if (ph != in.hash.digest()) { error = "session file: the file changed since the read pass (payload checksum)"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     st.error = SessionError::none;
@@ -1558,11 +1561,12 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 
 bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
                                 size_t& bytes, std::string& error, const SessionReadLimits& limits,
-                                std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus* status) {
+                                std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus* status,
+                                uint64_t* payload_hash) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = read_stream_impl(path, id, meta, bytes, error, limits, kv_part_bytes, st);
+        ok = read_stream_impl(path, id, meta, bytes, error, limits, kv_part_bytes, st, payload_hash);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;
@@ -1574,11 +1578,11 @@ bool session_file_read_streamed(const std::string& path, const SessionFileIdenti
 
 bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
-                                 SessionStatus* status) {
+                                 SessionStatus* status, uint64_t* payload_hash) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = apply_stream_impl(path, id, sink, kv_part_bytes, error, st);
+        ok = apply_stream_impl(path, id, sink, kv_part_bytes, error, st, payload_hash);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;
