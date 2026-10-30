@@ -10653,9 +10653,17 @@ int main(int argc, char** argv) {
                 }
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 auto admit = [&](uint64_t need, std::string& w) {
-                    if (strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need, floor))
-                        return true;
+                    const std::optional<uint64_t> available = strata::core::available_host_bytes();
+                    if (strata::core::conversation_memory_admit(available, need, floor)) return true;
                     w = "not enough RAM for the save's transient buffers";
+                    if (available)
+                        std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (needs %llu MiB + the "
+                                     "%llu MiB floor, %llu MiB available)\n", (unsigned long long) (need >> 20),
+                                     (unsigned long long) (floor >> 20), (unsigned long long) (*available >> 20));
+                    else
+                        std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (needs %llu MiB + the "
+                                     "%llu MiB floor, available unknown)\n", (unsigned long long) (need >> 20),
+                                     (unsigned long long) (floor >> 20));
                     return false;
                 };
                 std::vector<ConvCheckpoint> disk_checks;
